@@ -4,12 +4,62 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
-const WAIT_FOR_REPLY = 5
+// WaitForHostReply is how long to host comeback in seconds
+const WaitForHostReply = 5
 
-// N.B json marshalling requires upper case identifiers. Use fields' tag to set the json element name
+const TranslateErrNoText = 400
+const TranslateErrAbuse = 429
+
+// These are PokeAPI expected data
+type pokeAPILanguage struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+type pokeAPIFlavorText struct {
+	Text     string          `json:"flavor_text"`
+	Language pokeAPILanguage `json:"language"`
+}
+
+// we poll directly from "pokemon-species" interface
+type pokeAPIResponse struct {
+	FlavorTextEntries []pokeAPIFlavorText `json:"flavor_text_entries"`
+	ID                int                 `json:"id"`
+	CaptureRate       int                 `json:"capture_rate"`
+	// etc...
+}
+
+// These are ::Shakespeare expected data
+type translateStatus struct {
+	Total int `json:"total"`
+}
+type translateContents struct {
+	Translated string `json:"translated"`
+	Original   string `json:"text"`
+	Scheme     string `json:"translation"`
+}
+type translateAPIResponse struct {
+	Status   translateStatus   `json:"success"`
+	Contents translateContents `json:"contents"`
+}
+
+type translateErr struct {
+	ID   int    `json:"code"`
+	Text string `json:"message"`
+}
+type translateErrReply struct {
+	Error translateErr `json:"error"`
+}
+
+//-------------------
+
+// N.B json marshalling requires exportable fields
+// Use fields' tag to set the json element name
 type apiStatus struct {
 	Ok     bool   `json:"success"`
 	Reason string `json:"text"`
@@ -19,6 +69,28 @@ type apiReply struct {
 	Name   string    `json:"name"`
 	Desc   string    `json:"description"`
 	Result apiStatus `json:"result"`
+}
+
+// apiErrors hides the low level errors into dedicates values for this API.
+type apiError struct {
+	ID   int
+	Text string
+}
+
+var apiErrNone = apiError{0, "SUCCESS"}
+var apiErrDescGet = apiError{100, "Cannot GET description"}
+var apiErrDescRead = apiError{101, "Cannot read description"}
+var apiErrDescJSON = apiError{102, "Invalid description or N/A"}
+var apiErrDescLang = apiError{103, "Language not supported"}
+
+var apiErrTransFetch = apiError{200, "Cannot fetch translation"}
+var apiErrTransRead = apiError{201, "Cannot read translation"}
+var apiErrTransJSON = apiError{202, "Invalid translation or N/A"}
+var apiErrTransRequest = apiError{203, "Missing 'text' field"}
+var apiErrTransOverload = apiError{204, "Too Many Requests"}
+
+func (e apiError) Error() string {
+	return e.Text
 }
 
 //  interface for converting from name -> translated attribute
@@ -42,51 +114,100 @@ type webShakesPmon struct {
 	urlShakespeare string
 }
 
-// reply format expected from PokeAPI::species
-type Language struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-}
-type FlavorText struct {
-	Text     string   `json:"flavor_text"`
-	Language Language `json:"language"`
-}
-type descReply struct {
-	FlavorTextEntries []FlavorText `json:"flavor_text_entries"`
-}
-
-// stub:
+/**
+Pulls the description of the 'name' character over the provided service point
+Returns: the English description or one of errors:
+  - apiErrDescGet: http failed
+  - apiErrDescRead: failure to read http reply
+  - apiErrDescJSON: the reply is not a valid JSON
+  - apiErrDescLang: the JSON reply does not contain a description
+*/
 func (r webShakesPmon) describe(name string) (string, error) {
 	// todo: validate no sub-paths
 
 	client := &http.Client{
-		Timeout: time.Second * 5,
+		Timeout: time.Second * WaitForHostReply,
 	}
 
 	res, err := client.Get(r.urlPokeAPI + name)
 	if err != nil {
-		return "", err
+		return "", apiErrDescGet
 	}
 
-	var reply descReply
+	var reply pokeAPIResponse
 	js, err := ioutil.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
-		return "", err
+		return "", apiErrDescRead
 	}
 
 	if err = json.Unmarshal(js, &reply); err != nil {
-		return "", err
+		return "", apiErrDescJSON
 	}
-	// lookup the english type reply, otherwiae cannot translate
-	return reply.FlavorTextEntries[0].Text, nil
 
+	for _, r := range reply.FlavorTextEntries {
+		if r.Language.Name == "en" {
+			return r.Text, nil
+		}
+	}
+
+	return "", apiErrDescLang
 }
 
-// stub: GET method from uri and parse json reply into string
+/**
+Pulls the Shakespearean translation of a text
+Returns: text or one of errors:
+  - apiErrTransFetch: http exchange failed
+  - apiErrTransRead: failure to read http reply
+  - apiErrTransJSON: the reply is not a valid JSON
+  - apiErrTransRequest when the 'text' field is missing from the request
+  - apiErrTransOverload too many requests on the translation service
+*/
 func (r webShakesPmon) translate(text string) (string, error) {
 
-	return "This is a noddy translation of: " + text, nil
+	client := &http.Client{
+		Timeout: time.Second * WaitForHostReply,
+	}
+
+	params := url.Values{}
+	params.Set("text", text)
+
+	request, _ := http.NewRequest("POST", r.urlShakespeare, strings.NewReader(params.Encode()))
+	request.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Add("Content-Length", strconv.Itoa(len(params.Encode())))
+
+	res, err := client.Do(request)
+	if err != nil {
+		return "", apiErrTransFetch
+	}
+
+	var replyOK translateAPIResponse
+	var replyErr translateErrReply
+
+	js, err := ioutil.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		return "", apiErrTransRead
+	}
+
+	err = json.Unmarshal(js, &replyOK)
+	if err != nil || replyOK.Contents.Original == "" {
+		err = json.Unmarshal(js, &replyErr)
+		if err != nil || replyErr.Error.Text == "" {
+			return "", apiErrTransJSON
+		}
+
+		switch replyErr.Error.ID {
+		case TranslateErrNoText:
+			return "", apiErrTransRequest
+		case TranslateErrAbuse:
+			return "", apiErrTransOverload
+		default:
+			return "", apiErrTransJSON
+		}
+	}
+
+	return replyOK.Contents.Translated, nil
 }
 
 func newAPIHandler(d name2desc) http.HandlerFunc {
@@ -99,7 +220,7 @@ func newAPIHandler(d name2desc) http.HandlerFunc {
 		if description, err = getDescription(name, d); err != nil {
 			resp = apiReply{name, "", apiStatus{false, err.Error()}}
 		} else if translation, err = getTranslation(description, d); err != nil {
-			resp = apiReply{name, "", apiStatus{true, err.Error()}}
+			resp = apiReply{name, "", apiStatus{false, err.Error()}}
 		} else {
 			resp = apiReply{name, translation, apiStatus{true, "Conversion completed."}}
 		}
