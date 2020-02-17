@@ -212,22 +212,25 @@ func (r webShakesPmon) translate(text string) (string, error) {
 
 func newAPIHandler(d name2desc) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		name := r.URL.Path[1:]
 		var resp apiReply
 		var description, translation string
 		var err error
 
-		if description, err = getDescription(name, d); err != nil {
-			resp = apiReply{name, "", apiStatus{false, err.Error()}}
-		} else if translation, err = getTranslation(description, d); err != nil {
-			resp = apiReply{name, "", apiStatus{false, err.Error()}}
-		} else {
-			resp = apiReply{name, translation, apiStatus{true, "Conversion completed."}}
+		seg := strings.Split(r.URL.Path[1:], "/")
+
+		if seg[0] == "pokemon" && len(seg) == 2 {
+			name := seg[1]
+
+			if description, err = getDescription(name, d); err != nil {
+				resp = apiReply{name, "", apiStatus{false, err.Error()}}
+			} else if translation, err = getTranslation(description, d); err != nil {
+				resp = apiReply{name, "", apiStatus{false, err.Error()}}
+			} else {
+				resp = apiReply{name, translation, apiStatus{true, "Conversion completed."}}
+			}
+			e := json.NewEncoder(w)
+			e.Encode(resp)
 		}
-
-		e := json.NewEncoder(w)
-		e.Encode(resp)
-
 	})
 }
 
@@ -235,6 +238,6 @@ func main() {
 	proxy := webShakesPmon{"https://pokeapi.co/api/v2/pokemon-species/",
 		"https://api.funtranslations.com/translate/shakespeare.json"}
 
-	http.HandleFunc("/", newAPIHandler(proxy))
+	http.HandleFunc("/pokemon/", newAPIHandler(proxy))
 	http.ListenAndServe(":5000", nil)
 }
